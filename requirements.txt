@@ -6,3 +6,5 @@ statsmodels
 matplotlib
 joblib
 pulp
+xgboost
+prophet
