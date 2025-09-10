@@ -1,0 +1,281 @@
+import os
+import io
+import json
+import time
+import math
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    mean_absolute_error, mean_squared_error, r2_score,
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix
+)
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier, IsolationForest
+from sklearn.svm import SVC, OneClassSVM
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import TruncatedSVD
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
+import joblib
+import matplotlib.pyplot as plt
+
+# Time series
+import statsmodels.api as sm
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+ARTIFACT_DIR = "artifacts"
+os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+st.set_page_config(page_title="Finance ML Workbench", layout="wide")
+st.title("🧭 Finance ML Workbench — Select a Problem Type")
+
+PROBLEM_TYPES = [
+    "Regression",
+    "Classification",
+    "Clustering",
+    "Time Series Forecasting",
+    "Anomaly Detection",
+    "Recommendation System (stub)",
+    "Optimization (stub)"
+]
+
+pt = st.sidebar.selectbox("Problem Type", PROBLEM_TYPES)
+st.sidebar.info("Upload a CSV and configure options for the selected problem type.")
+
+uploaded = st.file_uploader("Upload CSV data", type=["csv"])
+if uploaded is not None:
+    df = pd.read_csv(uploaded)
+    st.write("### Data Preview", df.head())
+
+def split_features(df, target):
+    X = df.drop(columns=[target])
+    y = df[target]
+    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = list(set(X.columns) - set(num_cols))
+    pre = ColumnTransformer([
+        ("num", Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]), num_cols),
+        ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore"))]), cat_cols),
+    ])
+    return X, y, pre
+
+def save_artifacts(name, model=None, metrics=None, extra=None):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    base = os.path.join(ARTIFACT_DIR, f"{name}_{stamp}")
+    os.makedirs(base, exist_ok=True)
+    if model is not None:
+        joblib.dump(model, os.path.join(base, "model.pkl"))
+    if metrics is not None:
+        with open(os.path.join(base, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+    if extra is not None:
+        with open(os.path.join(base, "extra.json"), "w") as f:
+            json.dump(extra, f, indent=2)
+    st.success(f"Artifacts saved to `{base}`")
+    return base
+
+# ---------- Regression ----------
+def run_regression(df):
+    target = st.selectbox("Select target (numeric)", df.select_dtypes(include=[np.number]).columns)
+    algo = st.selectbox("Algorithm", ["LinearRegression", "RandomForestRegressor"])
+    test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
+    if st.button("Train Regression"):
+        X, y, pre = split_features(df, target)
+        if algo == "LinearRegression":
+            model = Pipeline([("pre", pre), ("clf", LinearRegression())])
+        else:
+            model = Pipeline([("pre", pre), ("clf", RandomForestRegressor(n_estimators=300, random_state=42))])
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42)
+        model.fit(Xtr, ytr)
+        pred = model.predict(Xte)
+        mae = mean_absolute_error(yte, pred)
+        rmse = mean_squared_error(yte, pred, squared=False)
+        r2 = r2_score(yte, pred)
+        st.write({"MAE": mae, "RMSE": rmse, "R2": r2})
+        save_artifacts("regression", model, {"MAE": mae, "RMSE": rmse, "R2": r2})
+
+# ---------- Classification ----------
+def run_classification(df):
+    target = st.selectbox("Select target (categorical/binary)", df.columns)
+    algo = st.selectbox("Algorithm", ["LogisticRegression", "RandomForestClassifier", "SVM (linear)"])
+    test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
+    if st.button("Train Classification"):
+        # Make sure target is categorical
+        y = df[target].astype("category")
+        df2 = df.copy()
+        df2[target] = y.cat.codes
+        X, y, pre = split_features(df2, target)
+        if algo == "LogisticRegression":
+            clf = LogisticRegression(max_iter=500)
+        elif algo == "RandomForestClassifier":
+            clf = RandomForestClassifier(n_estimators=300, random_state=42)
+        else:
+            clf = SVC(kernel="linear")
+        model = Pipeline([("pre", pre), ("clf", clf)])
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
+        model.fit(Xtr, ytr)
+        pred = model.predict(Xte)
+        acc = accuracy_score(yte, pred)
+        prec = precision_score(yte, pred, average="weighted", zero_division=0)
+        rec = recall_score(yte, pred, average="weighted", zero_division=0)
+        f1 = f1_score(yte, pred, average="weighted", zero_division=0)
+        st.write({"accuracy": acc, "precision": prec, "recall": rec, "f1": f1})
+        cm = confusion_matrix(yte, pred)
+        st.write("Confusion Matrix")
+        st.dataframe(pd.DataFrame(cm))
+        save_artifacts("classification", model, {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1})
+
+# ---------- Clustering ----------
+def run_clustering(df):
+    # Use numeric features only
+    X = df.select_dtypes(include=[np.number]).copy()
+    st.caption("Only numeric features are used for clustering. Consider encoding before upload if needed.")
+    algo = st.selectbox("Algorithm", ["KMeans", "DBSCAN", "Agglomerative"])
+    if algo == "KMeans":
+        k = st.slider("k (clusters)", 2, 12, 4)
+    elif algo == "DBSCAN":
+        eps = st.number_input("eps", value=0.5, min_value=0.05, step=0.05)
+        min_samples = st.number_input("min_samples", value=5, min_value=2, step=1)
+    else:
+        k = st.slider("n_clusters", 2, 12, 4)
+
+    if st.button("Run Clustering"):
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        if algo == "KMeans":
+            model = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = model.fit_predict(Xs)
+        elif algo == "DBSCAN":
+            model = DBSCAN(eps=eps, min_samples=int(min_samples))
+            labels = model.fit_predict(Xs)
+        else:
+            model = AgglomerativeClustering(n_clusters=k)
+            labels = model.fit_predict(Xs)
+        df_out = df.copy()
+        df_out["cluster"] = labels
+        st.write("Clustered Sample", df_out.head())
+        if len(set(labels)) > 1 and -1 not in set(labels):
+            sil = silhouette_score(Xs, labels)
+            st.write({"silhouette_score": sil})
+            save_artifacts("clustering", model, {"silhouette_score": sil})
+        else:
+            st.info("Silhouette score not meaningful with current labels.")
+            save_artifacts("clustering", model, {"note": "no_silhouette"})
+
+# ---------- Time Series ----------
+def run_timeseries(df):
+    date_col = st.selectbox("Date column", df.columns)
+    target = st.selectbox("Target (numeric)", df.select_dtypes(include=[np.number]).columns)
+    freq = st.text_input("Pandas frequency (e.g., D, W, M)", "M")
+    horizon = st.number_input("Forecast horizon (periods)", 3, 60, 12)
+    if st.button("Forecast"):
+        ts = df[[date_col, target]].dropna().copy()
+        ts[date_col] = pd.to_datetime(ts[date_col])
+        ts = ts.set_index(date_col).sort_index()
+        y = ts[target].asfreq(freq).interpolate()
+        # Simple SARIMAX auto-order via heuristics (p,d,q)=(1,1,1)
+        model = SARIMAX(y, order=(1,1,1), seasonal_order=(1,1,1, max(1, pd.tseries.frequencies.to_offset(freq).n)))
+        res = model.fit(disp=False)
+        fc = res.get_forecast(steps=int(horizon))
+        pred = fc.predicted_mean
+        conf = fc.conf_int()
+        out = pd.DataFrame({"y": y, "forecast": pred})
+        st.line_chart(out)
+        metrics = {"aic": float(res.aic), "bic": float(res.bic)}
+        st.write(metrics)
+        save_artifacts("timeseries", None, metrics, extra={"last_forecast": pred.tail(1).to_dict()})
+
+# ---------- Anomaly Detection ----------
+def run_anomaly(df):
+    X = df.select_dtypes(include=[np.number]).copy()
+    algo = st.selectbox("Algorithm", ["IsolationForest", "OneClassSVM"])
+    cont = st.slider("Contamination (expected outlier %)", 0.01, 0.2, 0.05, 0.01)
+    if st.button("Detect Anomalies"):
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        if algo == "IsolationForest":
+            model = IsolationForest(contamination=cont, random_state=42)
+        else:
+            model = OneClassSVM(nu=cont, kernel="rbf")
+        labels = model.fit_predict(Xs)  # -1 = outlier
+        df_out = df.copy()
+        df_out["is_outlier"] = (labels == -1).astype(int)
+        st.write("Flagged data", df_out.head())
+        st.metric("Outliers found", int(df_out["is_outlier"].sum()))
+        save_artifacts("anomaly", model, {"outliers": int(df_out['is_outlier'].sum())})
+
+# ---------- Recommender (stub) ----------
+def run_recommender_stub(df):
+    st.info("Expected columns: user_id, item_id, rating (0-5).")
+    user_col = st.selectbox("User column", df.columns)
+    item_col = st.selectbox("Item column", df.columns, index=min(1, len(df.columns)-1))
+    rating_col = st.selectbox("Rating column", df.columns, index=min(2, len(df.columns)-1))
+    target_user = st.text_input("User to recommend for", "")
+    topn = st.slider("Top-N", 3, 20, 5)
+    if st.button("Build & Recommend"):
+        pivot = df.pivot_table(index=user_col, columns=item_col, values=rating_col, aggfunc="mean").fillna(0.0)
+        # Simple MF-like compression then cosine neighbors
+        svd = TruncatedSVD(n_components=min(50, max(2, min(pivot.shape)-1)), random_state=42)
+        U = svd.fit_transform(pivot)
+        sims = cosine_similarity(U)
+        sim_df = pd.DataFrame(sims, index=pivot.index, columns=pivot.index)
+        if target_user not in sim_df.index:
+            st.error("Target user not found.")
+            return
+        similar_users = sim_df[target_user].drop(target_user).sort_values(ascending=False).head(5).index
+        candidate_scores = pivot.loc[similar_users].replace(0, np.nan).mean().dropna().sort_values(ascending=False)
+        recs = candidate_scores.head(topn)
+        st.write("Recommendations", recs)
+
+# ---------- Optimization (stub) ----------
+def run_optimization_stub(df):
+    st.info("Expected columns: project, cost, roi; provide a Budget in the sidebar.")
+    budget = st.number_input("Budget constraint", min_value=0.0, value=1000.0, step=100.0)
+    try:
+        from pulp import LpProblem, LpVariable, LpMaximize, lpSum, LpBinary, PULP_CBC_CMD
+    except Exception:
+        st.error("Install pulp to enable optimization.")
+        return
+    proj_col = st.selectbox("Project column", df.columns)
+    cost_col = st.selectbox("Cost column", df.columns)
+    roi_col = st.selectbox("ROI column", df.columns)
+    if st.button("Optimize Portfolio"):
+        items = df[[proj_col, cost_col, roi_col]].dropna().copy()
+        items.columns = ["proj", "cost", "roi"]
+        m = LpProblem("BudgetAlloc", LpMaximize)
+        x = {p: LpVariable(f"x_{i}", cat=LpBinary) for i, p in enumerate(items["proj"])}
+        m += lpSum(x[p]*float(r) for p, r in zip(items["proj"], items["roi"]))
+        m += lpSum(x[p]*float(c) for p, c in zip(items["proj"], items["cost"])) <= float(budget)
+        m.solve(PULP_CBC_CMD(msg=False))
+        chosen = [p for p in items["proj"] if x[p].value() == 1]
+        st.write("Selected projects:", chosen)
+        st.metric("Total ROI", float(sum(items.set_index("proj").loc[chosen]["roi"])) if chosen else 0.0)
+
+# ---- Router ----
+if uploaded is None:
+    st.warning("Upload a CSV to begin.")
+else:
+    if pt == "Regression":
+        run_regression(df)
+    elif pt == "Classification":
+        run_classification(df)
+    elif pt == "Clustering":
+        run_clustering(df)
+    elif pt == "Time Series Forecasting":
+        run_timeseries(df)
+    elif pt == "Anomaly Detection":
+        run_anomaly(df)
+    elif pt == "Recommendation System (stub)":
+        run_recommender_stub(df)
+    elif pt == "Optimization (stub)":
+        run_optimization_stub(df)
