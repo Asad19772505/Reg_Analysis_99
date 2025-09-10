@@ -25,10 +25,22 @@ from sklearn.svm import SVC, OneClassSVM
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 from sklearn.decomposition import TruncatedSVD
-from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import cosine_similarity
 import joblib
 import matplotlib.pyplot as plt
+
+# Optional libs
+try:
+    from xgboost import XGBRegressor, XGBClassifier
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
+
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except Exception:
+    PROPHET_AVAILABLE = False
 
 # Time series
 import statsmodels.api as sm
@@ -87,19 +99,30 @@ def save_artifacts(name, model=None, metrics=None, extra=None):
 # ---------- Regression ----------
 def run_regression(df):
     target = st.selectbox("Select target (numeric)", df.select_dtypes(include=[np.number]).columns)
-    algo = st.selectbox("Algorithm", ["LinearRegression", "RandomForestRegressor"])
+    algo_choices = ["LinearRegression", "RandomForestRegressor"]
+    if XGB_AVAILABLE:
+        algo_choices.append("XGBoostRegressor")
+    else:
+        st.caption("Tip: install xgboost to enable XGBoostRegressor")
+    algo = st.selectbox("Algorithm", algo_choices)
     test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
     if st.button("Train Regression"):
         X, y, pre = split_features(df, target)
         if algo == "LinearRegression":
             model = Pipeline([("pre", pre), ("clf", LinearRegression())])
-        else:
+        elif algo == "RandomForestRegressor":
             model = Pipeline([("pre", pre), ("clf", RandomForestRegressor(n_estimators=300, random_state=42))])
+        else:
+            model = Pipeline([("pre", pre), ("clf", XGBRegressor(
+                n_estimators=400, max_depth=6, learning_rate=0.05,
+                subsample=0.9, colsample_bytree=0.9, random_state=42,
+                n_jobs=-1, objective="reg:squarederror"))])
         Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42)
         model.fit(Xtr, ytr)
         pred = model.predict(Xte)
         mae = mean_absolute_error(yte, pred)
-        rmse = mean_squared_error(yte, pred, squared=False)
+        mse = mean_squared_error(yte, pred)        # cross-version safe
+        rmse = float(math.sqrt(mse))
         r2 = r2_score(yte, pred)
         st.write({"MAE": mae, "RMSE": rmse, "R2": r2})
         save_artifacts("regression", model, {"MAE": mae, "RMSE": rmse, "R2": r2})
@@ -107,10 +130,14 @@ def run_regression(df):
 # ---------- Classification ----------
 def run_classification(df):
     target = st.selectbox("Select target (categorical/binary)", df.columns)
-    algo = st.selectbox("Algorithm", ["LogisticRegression", "RandomForestClassifier", "SVM (linear)"])
+    algo_choices = ["LogisticRegression", "RandomForestClassifier", "SVM (linear)"]
+    if XGB_AVAILABLE:
+        algo_choices.append("XGBoostClassifier")
+    else:
+        st.caption("Tip: install xgboost to enable XGBoostClassifier")
+    algo = st.selectbox("Algorithm", algo_choices)
     test_size = st.slider("Test size", 0.1, 0.4, 0.2, 0.05)
     if st.button("Train Classification"):
-        # Make sure target is categorical
         y = df[target].astype("category")
         df2 = df.copy()
         df2[target] = y.cat.codes
@@ -119,8 +146,15 @@ def run_classification(df):
             clf = LogisticRegression(max_iter=500)
         elif algo == "RandomForestClassifier":
             clf = RandomForestClassifier(n_estimators=300, random_state=42)
+        elif algo == "SVM (linear)":
+            clf = SVC(kernel="linear", probability=True)
         else:
-            clf = SVC(kernel="linear")
+            clf = XGBClassifier(
+                n_estimators=500, max_depth=6, learning_rate=0.05,
+                subsample=0.9, colsample_bytree=0.9, random_state=42, n_jobs=-1,
+                objective="multi:softprob" if len(np.unique(y)) > 2 else "binary:logistic",
+                eval_metric="logloss"
+            )
         model = Pipeline([("pre", pre), ("clf", clf)])
         Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
         model.fit(Xtr, ytr)
@@ -137,7 +171,6 @@ def run_classification(df):
 
 # ---------- Clustering ----------
 def run_clustering(df):
-    # Use numeric features only
     X = df.select_dtypes(include=[np.number]).copy()
     st.caption("Only numeric features are used for clustering. Consider encoding before upload if needed.")
     algo = st.selectbox("Algorithm", ["KMeans", "DBSCAN", "Agglomerative"])
@@ -153,7 +186,7 @@ def run_clustering(df):
         scaler = StandardScaler()
         Xs = scaler.fit_transform(X)
         if algo == "KMeans":
-            model = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            model = KMeans(n_clusters=k, random_state=42, n_init=10)  # cross-version safe
             labels = model.fit_predict(Xs)
         elif algo == "DBSCAN":
             model = DBSCAN(eps=eps, min_samples=int(min_samples))
@@ -164,36 +197,74 @@ def run_clustering(df):
         df_out = df.copy()
         df_out["cluster"] = labels
         st.write("Clustered Sample", df_out.head())
-        if len(set(labels)) > 1 and -1 not in set(labels):
-            sil = silhouette_score(Xs, labels)
-            st.write({"silhouette_score": sil})
-            save_artifacts("clustering", model, {"silhouette_score": sil})
+        unique_labels = set(labels)
+        if len(unique_labels) > 1 and not (len(unique_labels) == 2 and (-1 in unique_labels and len(unique_labels) == 2)):
+            try:
+                sil = silhouette_score(Xs, labels)
+                st.write({"silhouette_score": sil})
+                save_artifacts("clustering", model, {"silhouette_score": sil})
+            except Exception as e:
+                st.info(f"Silhouette score not available: {e}")
+                save_artifacts("clustering", model, {"note": "no_silhouette"})
         else:
             st.info("Silhouette score not meaningful with current labels.")
             save_artifacts("clustering", model, {"note": "no_silhouette"})
 
 # ---------- Time Series ----------
+def _seasonal_periods(freq: str) -> int:
+    if not isinstance(freq, str):
+        return 12
+    f = freq.upper().strip()
+    mapping = {"D": 7, "W": 52, "M": 12, "Q": 4, "A": 1, "Y": 1}
+    return mapping.get(f, 12)
+
 def run_timeseries(df):
     date_col = st.selectbox("Date column", df.columns)
     target = st.selectbox("Target (numeric)", df.select_dtypes(include=[np.number]).columns)
     freq = st.text_input("Pandas frequency (e.g., D, W, M)", "M")
     horizon = st.number_input("Forecast horizon (periods)", 3, 60, 12)
+    model_choices = ["SARIMAX"]
+    if PROPHET_AVAILABLE:
+        model_choices.append("Prophet (additive)")
+    else:
+        st.caption("Tip: install prophet to enable Prophet model")
+    model_type = st.selectbox("Time-series model", model_choices)
+
     if st.button("Forecast"):
         ts = df[[date_col, target]].dropna().copy()
         ts[date_col] = pd.to_datetime(ts[date_col])
         ts = ts.set_index(date_col).sort_index()
         y = ts[target].asfreq(freq).interpolate()
-        # Simple SARIMAX auto-order via heuristics (p,d,q)=(1,1,1)
-        model = SARIMAX(y, order=(1,1,1), seasonal_order=(1,1,1, max(1, pd.tseries.frequencies.to_offset(freq).n)))
-        res = model.fit(disp=False)
-        fc = res.get_forecast(steps=int(horizon))
-        pred = fc.predicted_mean
-        conf = fc.conf_int()
-        out = pd.DataFrame({"y": y, "forecast": pred})
-        st.line_chart(out)
-        metrics = {"aic": float(res.aic), "bic": float(res.bic)}
-        st.write(metrics)
-        save_artifacts("timeseries", None, metrics, extra={"last_forecast": pred.tail(1).to_dict()})
+
+        if model_type.startswith("SARIMAX"):
+            sp = _seasonal_periods(freq)
+            model = SARIMAX(y, order=(1,1,1), seasonal_order=(1,1,1, sp))
+            res = model.fit(disp=False)
+            fc = res.get_forecast(steps=int(horizon))
+            pred = fc.predicted_mean
+            out = pd.DataFrame({"y": y, "forecast": pred})
+            st.line_chart(out)
+            metrics = {"aic": float(res.aic), "bic": float(res.bic)}
+            st.write(metrics)
+            save_artifacts("timeseries_sarimax", None, metrics, extra={"last_forecast": pred.tail(1).to_dict()})
+        else:
+            # Prophet expects ds,y columns
+            prophet_df = y.reset_index()
+            prophet_df.columns = ["ds", "y"]
+            m = Prophet(seasonality_mode="additive")
+            m.fit(prophet_df)
+            future = m.make_future_dataframe(periods=int(horizon), freq=freq)
+            fcst = m.predict(future)
+            merged = pd.merge(prophet_df, fcst[["ds", "yhat"]], on="ds", how="outer")
+            merged = merged.set_index("ds").sort_index()
+            merged.rename(columns={"y": "actual", "yhat": "forecast"}, inplace=True)
+            st.line_chart(merged)
+            # naive metric: MAE on in-sample overlap
+            insample = merged.dropna()
+            mae = float(np.mean(np.abs(insample["actual"] - insample["forecast"])))
+            st.write({"MAE (in-sample)": mae})
+            save_artifacts("timeseries_prophet", None, {"mae_insample": mae},
+                           extra={"last_forecast": merged["forecast"].tail(1).to_dict()})
 
 # ---------- Anomaly Detection ----------
 def run_anomaly(df):
@@ -224,8 +295,11 @@ def run_recommender_stub(df):
     topn = st.slider("Top-N", 3, 20, 5)
     if st.button("Build & Recommend"):
         pivot = df.pivot_table(index=user_col, columns=item_col, values=rating_col, aggfunc="mean").fillna(0.0)
-        # Simple MF-like compression then cosine neighbors
-        svd = TruncatedSVD(n_components=min(50, max(2, min(pivot.shape)-1)), random_state=42)
+        if pivot.shape[0] < 2 or pivot.shape[1] < 2:
+            st.error("Need at least 2 users and 2 items for recommendations.")
+            return
+        n_components = max(2, min(50, min(pivot.shape)-1))
+        svd = TruncatedSVD(n_components=n_components, random_state=42)
         U = svd.fit_transform(pivot)
         sims = cosine_similarity(U)
         sim_df = pd.DataFrame(sims, index=pivot.index, columns=pivot.index)
