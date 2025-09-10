@@ -26,6 +26,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity
 import joblib
 import matplotlib.pyplot as plt
+import io  # for Excel export
 
 # Optional libs
 try:
@@ -45,6 +46,63 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 ARTIFACT_DIR = "artifacts"
 os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+def _jsonable(obj):
+    """Recursively convert objects (np types, pandas, timestamps) to JSON-safe python types."""
+    import numpy as _np
+    import pandas as _pd
+    import datetime as _dt
+
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, _np.generic):
+        return obj.item()
+    if isinstance(obj, _np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, _pd.Timestamp):
+        return obj.to_pydatetime().isoformat()
+    if isinstance(obj, _dt.datetime):
+        return obj.isoformat()
+    if isinstance(obj, _dt.date):
+        return obj.isoformat()
+    if isinstance(obj, _pd.Series):
+        return {str(k): _jsonable(v) for k, v in obj.to_dict().items()}
+    if isinstance(obj, _pd.DataFrame):
+        return obj.to_dict(orient="records")
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+def _df_download_buttons(df: pd.DataFrame, base_name: str, label_prefix: str = "Download"):
+    """Render Streamlit buttons to download a DataFrame as CSV or Excel."""
+    if df is None or df.empty:
+        return
+    csv_bytes = df.to_csv(index=True).encode("utf-8")
+    st.download_button(
+        label=f"{label_prefix} CSV",
+        data=csv_bytes,
+        file_name=f"{base_name}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+    xbuf = io.BytesIO()
+    with pd.ExcelWriter(xbuf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=True, sheet_name="data")
+    xbuf.seek(0)
+    st.download_button(
+        label=f"{label_prefix} Excel",
+        data=xbuf.getvalue(),
+        file_name=f"{base_name}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
 
 st.set_page_config(page_title="Finance ML Workbench", layout="wide")
 st.title("🧭 Finance ML Workbench — Select a Problem Type")
@@ -88,10 +146,10 @@ def save_artifacts(name, model=None, metrics=None, extra=None):
         joblib.dump(model, os.path.join(base, "model.pkl"))
     if metrics is not None:
         with open(os.path.join(base, "metrics.json"), "w") as f:
-            json.dump(metrics, f, indent=2)
+            json.dump(_jsonable(metrics), f, indent=2)
     if extra is not None:
         with open(os.path.join(base, "extra.json"), "w") as f:
-            json.dump(extra, f, indent=2)
+            json.dump(_jsonable(extra), f, indent=2)
     st.success(f"Artifacts saved to `{base}`")
     return base
 
@@ -260,6 +318,7 @@ def run_timeseries(df):
             pred = res.get_forecast(steps=int(horizon)).predicted_mean
             out = pd.DataFrame({"y": s, "forecast": pred})
             st.line_chart(out)
+            _df_download_buttons(out, base_name="sarimax_forecast", label_prefix="Download SARIMAX")
             st.write({"aic": float(res.aic), "bic": float(res.bic)})
             save_artifacts("timeseries_sarimax", None, {"aic": float(res.aic), "bic": float(res.bic)},
                            extra={"last_forecast": pred.tail(1).to_dict()})
@@ -273,6 +332,7 @@ def run_timeseries(df):
             merged = pd.merge(prophet_df, fcst[["ds", "yhat"]], on="ds", how="outer").set_index("ds").sort_index()
             merged.rename(columns={"y": "actual", "yhat": "forecast"}, inplace=True)
             st.line_chart(merged)
+            _df_download_buttons(merged, base_name="prophet_forecast", label_prefix="Download Prophet")
             insample = merged.dropna()
             mae = float(np.mean(np.abs(insample["actual"] - insample["forecast"]))) if not insample.empty else None
             st.write({"MAE (in-sample)": mae})
